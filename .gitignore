@@ -1,0 +1,6 @@
+.venv/
+results*/
+outputs/
+data/lfw_groups/
+*.npz
+__pycache__/

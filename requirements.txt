@@ -1,0 +1,6 @@
+insightface>=0.7
+onnxruntime
+opencv-python
+numpy
+scipy
+scikit-learn
