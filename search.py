@@ -23,7 +23,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import cv2
 import numpy as np
 
-from tagger import DEFAULT_THRESHOLD, IMG_EXTS, load_models, read_image, try_read_image, write_image
+from fastpath import Profiler, iter_images
+from tagger import (DEFAULT_THRESHOLD, IMG_EXTS, detect_and_embed, load_models, read_image,
+                    try_read_image, write_image)
 
 CACHE_NAME = "album_cache.npz"
 
@@ -48,7 +50,7 @@ def person_embedding(app, ref_path):
     """Average embedding of the largest face in each reference photo."""
     embs = []
     for p in list_images(ref_path):
-        faces = app.get(read_image(p))
+        faces = detect_and_embed(app, read_image(p))
         if not faces:
             print(f"  [warn] no face found in reference {p}")
             continue
@@ -61,8 +63,11 @@ def person_embedding(app, ref_path):
     return c / np.linalg.norm(c)
 
 
-def index_album(app, photos_dir, cache_path, use_cache=True):
+def index_album(app, photos_dir, cache_path, use_cache=True, batch=True, prefetch=True,
+                profiler=None):
     """Detect + embed every face in the album once; reuse on later searches.
+    batch: one ArcFace call per photo; prefetch: decode images in a background thread;
+    profiler: fastpath.Profiler to fill with a per-stage time breakdown.
     Returns (index, unreadable_paths, n_indexed_now, seconds_spent_indexing)."""
     paths = list_images(photos_dir)
     cache = {}
@@ -72,22 +77,30 @@ def index_album(app, photos_dir, cache_path, use_cache=True):
     sigs = {p: file_sig(p) for p in paths}
     new = [p for p in paths if p not in cache or cache[p].get("sig") != sigs[p]]
     unreadable = []
+    timer = profiler
     t0 = time.perf_counter()
-    for i, p in enumerate(new, 1):
-        img = try_read_image(p)
+    if timer:
+        timer.start()
+    for i, (p, img) in enumerate(iter_images(new, try_read_image, prefetch=prefetch), 1):
+        if timer:
+            timer.lap("decode")
         if img is None:
             print(f"  [warn] could not read {p}")
             unreadable.append(p)
             cache.pop(p, None)
             continue
-        faces = app.get(img)
+        faces = detect_and_embed(app, img, timer, batch=batch)
         cache[p] = {
             "sig": sigs[p],
             "boxes": np.array([f.bbox for f in faces]).reshape(-1, 4),
             "embs": np.array([f.normed_embedding for f in faces]).reshape(-1, 512),
         }
-        if i % 25 == 0 or i == len(new):
+        if i % 100 == 0 or i == len(new):
             print(f"  indexed {i}/{len(new)} new photos")
+        if timer:
+            timer.n_photos += 1
+            timer.n_faces += len(faces)
+            timer.lap("overhead")
     elapsed = time.perf_counter() - t0
     if new or not os.path.exists(cache_path):
         np.savez(cache_path, index=np.array(cache, dtype=object))
@@ -104,7 +117,17 @@ def main():
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--no-cache", action="store_true",
                     help="re-index every photo (use for CPU vs GPU benchmarking)")
+    ap.add_argument("--trt", action="store_true",
+                    help="TensorRT EP in FP16 (implies --gpu; engines cached in trt_cache/)")
+    ap.add_argument("--no-batch", action="store_true",
+                    help="embed faces one ArcFace call at a time (old behaviour, for benchmarking)")
+    ap.add_argument("--no-prefetch", action="store_true",
+                    help="decode images on the main thread (old behaviour, for benchmarking)")
+    ap.add_argument("--profile", metavar="MD_FILE",
+                    help="time each stage while indexing and append a ms/photo table to MD_FILE")
     a = ap.parse_args()
+    if a.trt and a.no_batch:
+        ap.error("--no-batch is CUDA-only: the TensorRT engine is built for the fixed batch size")
 
     # matches/ reflects only THIS search; otherwise hits from a previous person linger
     matches_dir = os.path.join(a.out, "matches")
@@ -112,11 +135,13 @@ def main():
     os.makedirs(matches_dir)
 
     t_load = time.perf_counter()
-    app = load_models(use_gpu=a.gpu)
+    app = load_models(use_gpu=a.gpu, use_trt=a.trt)
     t_load = time.perf_counter() - t_load
     ref = person_embedding(app, a.person)   # also warms up the models before the timed loop
+    profiler = Profiler() if a.profile else None
     index, unreadable, n_indexed, t_index = index_album(
-        app, a.photos, os.path.join(a.out, CACHE_NAME), use_cache=not a.no_cache)
+        app, a.photos, os.path.join(a.out, CACHE_NAME), use_cache=not a.no_cache,
+        batch=not a.no_batch, prefetch=not a.no_prefetch, profiler=profiler)
 
     rows, n_match = [], 0
     for path in unreadable:
@@ -152,14 +177,22 @@ def main():
         print(f"\n{len(unreadable)} unreadable file(s) listed in results.csv")
     print(f"\nmarked copies -> {a.out}/matches/   full list -> {a.out}/results.csv")
 
-    device = "GPU (CUDA)" if a.gpu else "CPU"
-    print(f"\ntiming [{device}]: model load {t_load:.1f}s")
+    device = "GPU (TensorRT FP16)" if a.trt else "GPU (CUDA)" if a.gpu else "CPU"
+    config = (f"{device}, {'per-face' if a.no_batch else 'batched'} embedding, "
+              f"{'no prefetch' if a.no_prefetch else 'prefetch'}")
+    print(f"\ntiming [{config}]: model load {t_load:.1f}s")
     if n_indexed:
         print(f"  indexed {n_indexed} photo(s) in {t_index:.2f}s -> "
               f"{n_indexed / t_index:.1f} photos/s  ({1000 * t_index / n_indexed:.1f} ms/photo, "
               f"detect + embed)")
     else:
         print("  all photos served from cache, nothing indexed; use --no-cache to benchmark")
+    if profiler and profiler.n_photos:
+        table = profiler.table()
+        print("\n" + table)
+        with open(a.profile, "a", encoding="utf-8") as f:
+            f.write(f"\n### {config}\n`{a.photos}`, {profiler.n_photos} photos\n\n{table}\n")
+        print(f"profile appended to {a.profile}")
 
 
 if __name__ == "__main__":

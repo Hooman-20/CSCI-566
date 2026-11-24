@@ -23,24 +23,71 @@ DEFAULT_THRESHOLD = 0.45  # cosine similarity; best F1 + exact-match in the LFW-
 
 
 # ---------------------------------------------------------------- models
-def load_models(det_size=640, use_gpu=False):
+TRT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trt_cache")
+
+
+def _trt_options(**extra):
+    """TensorRT EP in FP16 with an on-disk engine cache (first run builds engines, ~1 min)."""
+    os.makedirs(TRT_CACHE_DIR, exist_ok=True)
+    opts = {
+        "trt_fp16_enable": "True",
+        "trt_engine_cache_enable": "True",
+        "trt_engine_cache_path": TRT_CACHE_DIR,
+        "trt_timing_cache_enable": "True",
+        "trt_timing_cache_path": TRT_CACHE_DIR,
+    }
+    opts.update(extra)
+    return opts
+
+
+def load_models(det_size=640, use_gpu=False, use_trt=False):
     # buffalo_l = SCRFD-10G detector + ArcFace ResNet50 (trained on WebFace600K)
+    use_gpu = use_gpu or use_trt
     if use_gpu:
         import onnxruntime as ort
         # onnxruntime-gpu needs CUDA 13 + cuDNN 9 DLLs. They come from the nvidia-* pip wheels
         # (pip install "onnxruntime-gpu[cuda,cudnn]"), which are not on PATH: load them explicitly.
+        # This MUST run before the first CUDA session, or ORT silently falls back to CPU.
         if hasattr(ort, "preload_dlls"):
             ort.preload_dlls()
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
     app = FaceAnalysis(name="buffalo_l", providers=providers,
                        allowed_modules=["detection", "recognition"])
     app.prepare(ctx_id=0 if use_gpu else -1, det_size=(det_size, det_size))
+    if use_trt:
+        # TensorRT 10 DLLs come from the tensorrt-cu13==10.x pip wheel (onnxruntime-gpu 1.31 is
+        # built against TensorRT 10, not 11); importing it puts nvinfer_10 on the DLL path.
+        import onnxruntime as ort
+        import tensorrt  # noqa: F401
+        from fastpath import EMBED_BATCH
+        trt_providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        def trt_session(model, shape):
+            # one engine for exactly this input shape; each model gets its own options because
+            # both call their input "input.1"
+            prof = f"{model.input_name}:{shape}"
+            return ort.InferenceSession(model.model_file, providers=trt_providers, provider_options=[
+                _trt_options(trt_profile_min_shapes=prof, trt_profile_opt_shapes=prof,
+                             trt_profile_max_shapes=prof), {}, {}])
+
+        # Detector: insightface would clone a fixed-size session by copying provider options
+        # back out of ORT, which breaks for TensorRT (it silently fell back to CUDA). Instead,
+        # give it a fixed det_size engine and route every request to that main session.
+        det = app.det_model
+        det.session = trt_session(det, f"1x3x{det_size}x{det_size}")
+        det.static_shape_sessions = False
+        det._reset_resolution_session_pool()
+        # ArcFace: fastpath always feeds exactly EMBED_BATCH faces (zero-padded)
+        rec = app.models["recognition"]
+        rec.session = trt_session(rec, f"{EMBED_BATCH}x3x112x112")
     if use_gpu:
-        # onnxruntime silently falls back to CPU if CUDA libs fail to load -> fail loudly instead
+        # onnxruntime silently falls back to CPU if CUDA/TensorRT libs fail to load -> fail loudly
+        want = "TensorrtExecutionProvider" if use_trt else "CUDAExecutionProvider"
         for name, model in app.models.items():
-            if "CUDAExecutionProvider" not in model.session.get_providers():
-                raise RuntimeError(f"--gpu requested but model '{name}' is running on CPU; "
-                                   "check onnxruntime-gpu / CUDA / cuDNN install")
+            if want not in model.session.get_providers():
+                raise RuntimeError(f"GPU requested but model '{name}' has no {want} "
+                                   f"(providers: {model.session.get_providers()}); "
+                                   "check onnxruntime-gpu / CUDA / cuDNN / TensorRT install")
     return app
 
 
@@ -68,9 +115,11 @@ def write_image(path, img):
     buf.tofile(path)
 
 
-def detect_and_embed(app, img):
-    """Returns list of faces; each has .bbox, .det_score, .normed_embedding (512-d, L2-normalized)."""
-    return app.get(img)
+def detect_and_embed(app, img, timer=None, batch=True):
+    """Returns list of faces; each has .bbox, .det_score, .normed_embedding (512-d, L2-normalized).
+    All faces of the photo are embedded in one batched ArcFace call (see fastpath.py)."""
+    import fastpath
+    return fastpath.detect_and_embed(app, img, timer or fastpath.NO_TIMER, batch=batch)
 
 
 # ---------------------------------------------------------------- enrollment
@@ -190,9 +239,11 @@ def main():
 
     for sp in (e, t, v):
         sp.add_argument("--gpu", action="store_true", help="use CUDA via onnxruntime-gpu")
+        sp.add_argument("--trt", action="store_true",
+                        help="use the TensorRT EP in FP16 (implies --gpu; engines cached in trt_cache/)")
 
     a = p.parse_args()
-    app = load_models(use_gpu=a.gpu)
+    app = load_models(use_gpu=a.gpu, use_trt=a.trt)
 
     if a.cmd == "enroll":
         names, cents = enroll(app, a.gallery)

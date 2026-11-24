@@ -9,7 +9,7 @@ import os
 import cv2
 import numpy as np
 
-from tagger import draw, match_faces, read_image, summary, write_image
+from tagger import detect_and_embed, draw, match_faces, read_image, summary, write_image
 
 
 def load_labels(path):
@@ -39,7 +39,7 @@ def run_eval(app, names, centroids, test_dir, labels_csv, out_dir, threshold):
     cache = []  # (image, faces, true_set) -> reuse detections for the threshold sweep
     for img_name in sorted(gt):
         img = read_image(os.path.join(test_dir, img_name))
-        faces = app.get(img)
+        faces = detect_and_embed(app, img)
         cache.append((img_name, img, faces, gt[img_name]))
 
     print(f"\n{'image':<24}{'faces':>6}  predicted  |  truth")

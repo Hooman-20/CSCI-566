@@ -17,7 +17,12 @@ Adding a new person = dropping a few photos in a folder and re-running `enroll`.
 pip install -r requirements.txt
 # GPU (RTX 5090): swap in onnxruntime-gpu + its CUDA 13/cuDNN 9 runtime wheels, then add --gpu
 pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]"
+# optional, for --trt (TensorRT FP16). onnxruntime-gpu 1.31 is built against TensorRT 10, not 11
+pip install "tensorrt-cu13==10.16.1.11"
 ```
+`--trt` builds FP16 engines on first use (~45 s) and caches them in `trt_cache/`; later runs load
+in ~1.5 s. Any script that creates GPU sessions itself must call `onnxruntime.preload_dlls()`
+first, otherwise onnxruntime silently falls back to CPU (`tagger.load_models` does this).
 Pretrained models (`buffalo_l`) download automatically to `~/.insightface/models` on first run.
 
 ## Usage
@@ -58,7 +63,9 @@ python search.py --person data/gallery/obama --photos data/test --gpu
 ```
 Writes boxed copies of matching photos to `results/matches/` and every photo's best
 similarity to `results/results.csv`. Album embeddings are cached, so later searches are
-instant; add `--no-cache` to force re-indexing (e.g. for timing).
+instant; add `--no-cache` to force re-indexing (e.g. for timing). `--trt` uses TensorRT FP16,
+and `--profile results/profile.md` appends a ms/photo breakdown per stage (decode, detection
+pre/infer/post, alignment, embedding, overhead).
 
 ## Results so far
 
@@ -116,8 +123,30 @@ Detection + embedding, from `search.py --no-cache` on 200 photos with 1–3 face
 | CPU | 13.9 | 71.8 |
 | GPU (CUDA, onnxruntime-gpu) | 44.5 | 22.5 |
 
-On LFW groups (up to 12 faces per photo) the GPU drops to about 31 photos/s, because faces are
-embedded one at a time. Batching should help there.
+### Speed-ups on LFW groups (RTX 5090)
+`search.py --no-cache` indexing of the 500 LFW group photos (5.0 faces/photo on average). Each row
+adds one change. photos/s is the median of 3 runs, and the stage breakdown comes from `--profile`
+(full tables in `results/profile.md`):
+
+| step | photos/s | ms/photo | det_infer | embed | decode | flag to turn it off |
+|---|---:|---:|---:|---:|---:|---|
+| baseline: CUDA, one ArcFace call per face | 36.3 | 27.5 | 4.4 | 17.2 | 1.6 | `--no-batch --no-prefetch` |
+| (a) all faces of a photo in one ArcFace call | 65.0 | 15.7 | 4.6 | 5.4 | 1.6 | `--no-prefetch` |
+| (b) + decode next images on a background thread | 71.3 | 13.8 | 4.2 | 5.2 | 0.1 | (default with `--gpu`) |
+| (c) + TensorRT EP, FP16, engine cache | **118.1** | **8.2** | 1.7 | 2.5 | 0.1 | (`--trt`) |
+
+Accuracy is unchanged with every step: CUDA and TensorRT FP16 both give precision 0.999, recall
+0.997, F1 0.998 and exact match 0.988 at threshold 0.45, with the same 6 error photos.
+
+- **Batching needs a fixed shape.** Plain batching made ArcFace *slower* (28 ms/photo):
+  onnxruntime's CUDA EP re-plans its cuDNN convolutions whenever the batch size changes, and the
+  face count changes every photo. Zero-padding every call to 16 faces (`fastpath.EMBED_BATCH`)
+  costs 4.2 ms per call, versus 2.9 ms for one face alone.
+- **TensorRT** gets one fixed-shape engine per model (detector 1×3×640×640, ArcFace 16×3×112×112).
+  insightface's own fixed-size detector session copies provider options back out of ORT, which
+  breaks for TensorRT and silently falls back to CUDA, so `load_models` builds both sessions itself.
+- **What's left:** CPU work (resize/normalize 2.1 ms, alignment 1.1 ms, NMS 0.5 ms) is now ~45% of
+  the time. Next steps are moving it to the prefetch thread or the GPU, and batching across photos.
 
 ## Roadmap
 - [x] Baseline numbers on LFW groups; pick threshold from the sweep (0.45)
@@ -127,7 +156,8 @@ embedded one at a time. Batching should help there.
 - [ ] Cluster "unknown" faces across an album (HDBSCAN) so you can name a cluster once
 - [ ] Train own embedder with ArcFace loss (CASIA-WebFace), compare to pretrained on LFW/CFP-FP
 - [x] Throughput benchmark GPU vs CPU (`search.py` timing printout)
-- [ ] TensorRT FP16/INT8 export; batch all faces per photo
+- [x] Batch all faces per photo; prefetch decoding; TensorRT FP16 (3.3× faster, same accuracy)
+- [ ] TensorRT INT8; move preprocessing off the main thread; batch across photos
 - [ ] Gradio demo
 
 ## Data note
