@@ -126,7 +126,7 @@ Detection + embedding, from `search.py --no-cache` on 200 photos with 1–3 face
 ### Speed-ups on LFW groups (RTX 5090)
 `search.py --no-cache` indexing of the 500 LFW group photos (5.0 faces/photo on average). Each row
 adds one change. photos/s is the median of 3 runs, and the stage breakdown comes from `--profile`
-(full tables in `results/profile.md`):
+(full tables in [docs/profile.md](docs/profile.md)):
 
 | step | photos/s | ms/photo | det_infer | embed | decode | flag to turn it off |
 |---|---:|---:|---:|---:|---:|---|
