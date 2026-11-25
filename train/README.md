@@ -58,8 +58,7 @@ Faces must be aligned with the standard 5-point ArcFace template (e.g. `insightf
 - LR is scaled linearly from 0.1 @ batch 512, 1 epoch linear warmup, then cosine decay.
 - Input convention: RGB, (x-127.5)/127.5. Training and inference must match.
 
-## Verified so far
-Smoke-tested on synthetic data on CPU and on the RTX 4070 Laptop GPU (loss falls, train acc ~99%,
-verification eval and the `.rec` converter run end to end). NOT yet run on real data.
-GPU-only throughput with AMP: r34 @ batch 128 ~450 img/s (4.3 GiB), r50 @ batch 64 ~370 img/s
-(2.9 GiB), i.e. roughly 18-22 min per CASIA-WebFace epoch before data-loading overhead.
+## Status
+Run end to end on real data (Colab T4): full r34 run 25 epochs (LFW 99.30, CFP-FP 94.29, AgeDB-30 93.23), 8-run
+ablation grid, hard-case study and augmentation fine-tune. See the top-level `README.md` and `results/`.
+Colab throughput was ~307 img/s (limited by 2 CPU cores for data loading).
