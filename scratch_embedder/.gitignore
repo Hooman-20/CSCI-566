@@ -1,0 +1,12 @@
+.venv/
+.claude/
+__pycache__/
+*.pyc
+# large / generated: share via Drive instead
+models/
+*.pt
+*.zip
+group_eval/lfw_groups/
+group_eval/*.log
+runs/
+data/
