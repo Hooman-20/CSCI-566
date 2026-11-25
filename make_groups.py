@@ -14,6 +14,12 @@ Output:
 Examples:
   python make_groups.py --source lfw --out data/lfw_groups          # downloads LFW (~200MB) on your machine
   python make_groups.py --source data/gallery --out data/demo_groups
+  python make_groups.py --source lfw --out data/lfw_groups_hard --hard --gpu   # degraded faces
+
+--hard degrades every face tile in the test photos (blur, 24-48 px low resolution, sunglasses/
+mask occlusion, low light, JPEG; see degrade.py). The gallery stays clean, as enrollment photos
+usually are. Degradations use their own RNG, so with the same --seed the groups, layout and
+labels are identical to the clean benchmark.
 """
 import argparse
 import csv
@@ -22,6 +28,8 @@ import random
 
 import cv2
 import numpy as np
+
+from degrade import default_face_box, degrade
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
@@ -111,15 +119,16 @@ class BystanderBlur:
         return max(range(len(boxes)), key=lambda i: score(boxes[i]))
 
     def __call__(self, img):
+        """Returns (image with bystanders blurred, main face box or None)."""
         self.stats["images"] += 1
         boxes = self.detect_all(img)
         if not boxes:
             self.stats["no_face"] += 1
-            return img
+            return img, None
         m = self.main_face(boxes, img.shape)
         others = [b for i, b in enumerate(boxes) if i != m]
         if not others:
-            return img
+            return img, boxes[m]
         self.stats["with_bystanders"] += 1
         self.stats["faces_blurred"] += len(others)
         out = img.copy()
@@ -137,7 +146,7 @@ class BystanderBlur:
         mx1, my1, mx2, my2 = [int(v) for v in boxes[m]]
         mx1, my1 = max(0, mx1), max(0, my1)
         out[my1:my2, mx1:mx2] = img[my1:my2, mx1:mx2]
-        return out
+        return out, boxes[m]
 
 
 def tile(images, cell=300, cols=None, pad=10, rng=None):
@@ -172,9 +181,12 @@ def main():
     ap.add_argument("--keep-bystanders", action="store_true",
                     help="don't blur non-main faces (old behaviour; unlabeled faces stay visible)")
     ap.add_argument("--gpu", action="store_true", help="run the bystander face detector on CUDA")
+    ap.add_argument("--hard", action="store_true",
+                    help="randomly degrade every face tile in the test photos (see degrade.py)")
     a = ap.parse_args()
     blur = None if a.keep_bystanders else BystanderBlur(use_gpu=a.gpu)
-    cleaned = {}  # (name, idx) -> probe image with bystanders blurred (computed lazily, only if used)
+    cleaned = {}  # (name, idx) -> (probe image with bystanders blurred, main face box), lazily
+    deg_counts = {}
 
     rng = np.random.default_rng(a.seed)
     random.seed(a.seed)
@@ -216,12 +228,22 @@ def main():
         picks = [(n, int(rng.integers(len(probes[n])))) for n in chosen]
         if blur is None:
             imgs = [probes[n][j] for n, j in picks]
+            boxes = [None] * len(picks)
         else:
             # no RNG use here, so the group composition is identical with or without blurring
             for n, j in picks:
                 if (n, j) not in cleaned:
                     cleaned[(n, j)] = blur(probes[n][j])
-            imgs = [cleaned[(n, j)] for n, j in picks]
+            imgs = [cleaned[(n, j)][0] for n, j in picks]
+            boxes = [cleaned[(n, j)][1] for n, j in picks]
+        if a.hard:
+            # separate RNG per (group, slot): the main rng sequence, and so groups/labels, is unchanged
+            for slot, (im, box) in enumerate(zip(imgs, boxes)):
+                drng = np.random.default_rng([a.seed, 1, gi, slot])
+                imgs[slot], applied = degrade(im, box if box is not None else default_face_box(im.shape),
+                                              drng)
+                for k in applied:
+                    deg_counts[k] = deg_counts.get(k, 0) + 1
         fname = f"group_{gi:04d}.jpg"
         cv2.imwrite(os.path.join(test_dir, fname), tile(imgs, rng=rng))
         truth = sorted(n for n in chosen if n in enrolled)
@@ -238,6 +260,9 @@ def main():
         s = blur.stats
         print(f"bystander blur: {s['images']} probe photos, {s['with_bystanders']} had bystanders "
               f"({s['faces_blurred']} faces blurred), {s['no_face']} with no detectable face")
+    if a.hard:
+        print("degradations applied (face tiles): " +
+              ", ".join(f"{k} {v}" for k, v in sorted(deg_counts.items())))
     print(f"next: python tagger.py enroll --gallery {gallery_dir} --out {a.out}/gallery.npz")
     print(f"      python tagger.py eval --gallery-file {a.out}/gallery.npz "
           f"--test-dir {test_dir} --labels {a.out}/test_labels.csv --out-dir {a.out}/outputs")

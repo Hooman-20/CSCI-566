@@ -1,7 +1,9 @@
 .venv/
 results*/
 outputs/
-data/lfw_groups/
+data/lfw_groups*/
 *.npz
 __pycache__/
 trt_cache/
+!models/*.npz
+clip_cache/

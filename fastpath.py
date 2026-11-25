@@ -18,7 +18,7 @@ from insightface.app.common import Face
 from insightface.model_zoo.scrfd import distance2bbox, distance2kps
 from insightface.utils import face_align
 
-STAGES = ["decode", "det_pre", "det_infer", "det_post", "align", "embed", "overhead"]
+STAGES = ["decode", "det_pre", "det_infer", "det_post", "align", "embed", "scene", "overhead"]
 STAGE_DESC = {
     "decode": "read file + JPEG decode (with prefetch: time spent waiting for the next image)",
     "det_pre": "resize + pad to 640x640 + normalize to NCHW blob",
@@ -26,6 +26,7 @@ STAGE_DESC = {
     "det_post": "anchor decode + score filter + NMS",
     "align": "5-point similarity warp to 112x112, per face",
     "embed": "ArcFace R50 preprocessing + session.run",
+    "scene": "CLIP ViT-B/32 session.run (resize/crop runs in the prefetch thread)",
     "overhead": "Face objects, result bookkeeping, Python loop",
 }
 # ArcFace always runs with this exact batch size (chunks padded with zeros). onnxruntime's CUDA EP
@@ -177,12 +178,17 @@ def embed(rec, img, kpss, timer=NO_TIMER, batch=True):
     return np.concatenate(feats)
 
 
-def detect_and_embed(app, img, timer=NO_TIMER, batch=True):
-    """Faces with .bbox, .kps, .det_score, .embedding / .normed_embedding (like FaceAnalysis.get)."""
+def detect_and_embed(app, img, timer=NO_TIMER, batch=True, adapt=True):
+    """Faces with .bbox, .kps, .det_score, .embedding / .normed_embedding (like FaceAnalysis.get).
+    If app.adapter is set (tagger.load_models(adapter=...)) and adapt=True, embeddings are
+    passed through it (counted in the 'embed' stage)."""
     dets, kpss = detect(app.det_model, img, timer)
     if len(dets) == 0:
         return []
     feats = embed(app.models["recognition"], img, kpss, timer, batch=batch)
+    if adapt and getattr(app, "adapter", None) is not None:
+        feats = app.adapter(feats)
+        timer.lap("embed")
     faces = []
     for d, k, e in zip(dets, kpss, feats):
         f = Face(bbox=d[:4], kps=k, det_score=d[4])

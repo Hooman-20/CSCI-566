@@ -40,7 +40,22 @@ def _trt_options(**extra):
     return opts
 
 
-def load_models(det_size=640, use_gpu=False, use_trt=False):
+def load_models(det_size=640, use_gpu=False, use_trt=False, adapter=None):
+    """adapter: path to an adapter .npz from train_adapter.py, applied to every embedding."""
+    app = _load_models(det_size, use_gpu, use_trt)
+    if adapter:
+        from adapter import Adapter
+        app.adapter = Adapter(adapter)
+    else:
+        app.adapter = None
+    return app
+
+
+def adapter_id(app):
+    return app.adapter.id if getattr(app, "adapter", None) is not None else ""
+
+
+def _load_models(det_size=640, use_gpu=False, use_trt=False):
     # buffalo_l = SCRFD-10G detector + ArcFace ResNet50 (trained on WebFace600K)
     use_gpu = use_gpu or use_trt
     if use_gpu:
@@ -115,11 +130,12 @@ def write_image(path, img):
     buf.tofile(path)
 
 
-def detect_and_embed(app, img, timer=None, batch=True):
+def detect_and_embed(app, img, timer=None, batch=True, adapt=True):
     """Returns list of faces; each has .bbox, .det_score, .normed_embedding (512-d, L2-normalized).
-    All faces of the photo are embedded in one batched ArcFace call (see fastpath.py)."""
+    All faces of the photo are embedded in one batched ArcFace call (see fastpath.py), then
+    passed through the adapter if one was loaded (adapt=False returns raw ArcFace embeddings)."""
     import fastpath
-    return fastpath.detect_and_embed(app, img, timer or fastpath.NO_TIMER, batch=batch)
+    return fastpath.detect_and_embed(app, img, timer or fastpath.NO_TIMER, batch=batch, adapt=adapt)
 
 
 # ---------------------------------------------------------------- enrollment
@@ -151,12 +167,22 @@ def enroll(app, gallery_dir):
     return names, np.stack(centroids)
 
 
-def save_gallery(path, names, centroids):
-    np.savez(path, names=np.array(names), centroids=centroids)
+def save_gallery(path, names, centroids, adapter=""):
+    """adapter: id of the adapter the embeddings went through ('' = plain ArcFace)."""
+    np.savez(path, names=np.array(names), centroids=centroids, adapter=np.array(adapter))
 
 
-def load_gallery(path):
+def load_gallery(path, expect_adapter=None):
+    """If expect_adapter is given (adapter id or ''), refuse a gallery enrolled differently:
+    adapted and plain embeddings live in different spaces and must not be compared."""
     d = np.load(path, allow_pickle=False)
+    if expect_adapter is not None:
+        got = str(d["adapter"]) if "adapter" in d else ""
+        if got != expect_adapter:
+            def desc(x):
+                return f"adapter {x}" if x else "no adapter"
+            raise SystemExit(f"{path} was enrolled with {desc(got)} but this run uses "
+                             f"{desc(expect_adapter)}; re-enroll with the same --adapter setting")
     return [str(n) for n in d["names"]], d["centroids"]
 
 
@@ -241,17 +267,20 @@ def main():
         sp.add_argument("--gpu", action="store_true", help="use CUDA via onnxruntime-gpu")
         sp.add_argument("--trt", action="store_true",
                         help="use the TensorRT EP in FP16 (implies --gpu; engines cached in trt_cache/)")
+        sp.add_argument("--adapter", metavar="NPZ",
+                        help="apply a train_adapter.py adapter to every embedding; the gallery must "
+                             "be enrolled with the same adapter")
 
     a = p.parse_args()
-    app = load_models(use_gpu=a.gpu, use_trt=a.trt)
+    app = load_models(use_gpu=a.gpu, use_trt=a.trt, adapter=a.adapter)
 
     if a.cmd == "enroll":
         names, cents = enroll(app, a.gallery)
-        save_gallery(a.out, names, cents)
+        save_gallery(a.out, names, cents, adapter=adapter_id(app))
         print(f"saved {len(names)} people -> {a.out}")
 
     elif a.cmd == "tag":
-        names, cents = load_gallery(a.gallery_file)
+        names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app))
         img = read_image(a.image)
         faces, labels = tag_image(app, img, names, cents, a.threshold)
         for f, (n, s) in zip(faces, labels):
@@ -263,7 +292,7 @@ def main():
 
     elif a.cmd == "eval":
         from evaluate import run_eval
-        names, cents = load_gallery(a.gallery_file)
+        names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app))
         run_eval(app, names, cents, a.test_dir, a.labels, a.out_dir, a.threshold)
 
 
