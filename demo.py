@@ -10,7 +10,7 @@ import cv2
 
 import scene as scn
 from tagger import (DEFAULT_THRESHOLD, adapter_id, detect_and_embed, draw, load_gallery,
-                    load_models, match_faces, summary)
+                    load_models, match_faces, model_id, summary)
 
 
 def build(app, scene_tagger, names, cents, threshold):
@@ -57,11 +57,13 @@ def main():
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--trt", action="store_true")
     ap.add_argument("--adapter", metavar="NPZ", help="gallery must be enrolled with the same adapter")
+    ap.add_argument("--model", metavar="ONNX", help="replacement recognizer (gallery enrolled with it)")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--share", action="store_true", help="public gradio.live link")
     a = ap.parse_args()
-    app = load_models(use_gpu=a.gpu, use_trt=a.trt, adapter=a.adapter)
-    names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app))
+    app = load_models(use_gpu=a.gpu, use_trt=a.trt, adapter=a.adapter, model=a.model)
+    names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app),
+                                expect_model=model_id(app))
     scene_tagger = scn.SceneTagger(use_gpu=a.gpu, use_trt=a.trt)
     ui, _ = build(app, scene_tagger, names, cents, a.threshold)
     print(f"gallery: {len(names)} people from {a.gallery_file}")

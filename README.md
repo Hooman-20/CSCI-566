@@ -186,6 +186,102 @@ Accuracy is unchanged with every step: CUDA and TensorRT FP16 both give precisio
 - **What's left:** CPU work (resize/normalize 2.1 ms, alignment 1.1 ms, NMS 0.5 ms) is now ~45% of
   the time. Next steps are moving it to the prefetch thread or the GPU, and batching across photos.
 
+## Hard photos: embedding adapter vs fine-tuned ArcFace
+
+**Hard benchmark.** `make_groups.py --hard` builds `data/lfw_groups_hard`, which has the same 500
+groups, layout and labels as the clean benchmark. Every face tile gets a random mix of gaussian
+blur, downscaling to a 24–48 px face, sunglasses or mask occlusion, low light, and JPEG
+compression (`degrade.py`). The gallery stays clean. On it, the detector finds 2,381 of the 2,511
+faces, so about 5% are missed before recognition even starts.
+
+**Training data.** Both models train only on LFW people that cannot appear in the benchmark.
+The benchmark uses everyone with ≥ 10 photos (enrolled and distractors), so training uses the
+other 5,591 people (8,909 photos). The scripts also check against the benchmark galleries and
+labels, and stop on any overlap. 302 of those people with ≥ 2 photos are held out entirely as
+**validation people**, and checkpoints, hyperparameters and thresholds are picked on them. The
+benchmark is used only for the final table.
+
+**The two models:**
+- **Adapter** (`train_adapter.py`, `--adapter models/adapter.npz`): a residual MLP on the frozen
+  512-d ArcFace embedding, initialised as the identity. It trains on cached embeddings of clean
+  photos and 24 degraded versions of each, with a loss that pulls degraded embeddings toward
+  their clean embedding, plus an anchor that keeps clean embeddings in place. Twelve
+  configurations were tried, with CosFace weight 0–1, pull weight 1–4, hidden size 256–1024,
+  dropout, weight decay, and 8 vs 24 degradations per photo. All of them stopped between 0.915
+  and 0.922 degraded TAR@FAR=1e-3 on validation (pretrained: 0.909). With CosFace on, the MLP
+  memorises the training identities. The one picked has hidden size 256, dropout 0.5, and no
+  CosFace term. Curves: [docs/adapter_curves.png](docs/adapter_curves.png).
+- **Fine-tuned** (`finetune_data.py` + `train_finetune.py`, `--model models/arcface_r50_ft.onnx`):
+  the ArcFace R50 ONNX is converted to PyTorch with onnx2torch (max difference vs onnxruntime
+  1e-6). Stem, stage 1 and stage 2 are frozen, and stages 3–4 plus the embedding head are trained
+  (42.2M of 43.6M params) on CUDA. Each step degrades the photo on the fly with the same
+  generator, using a small alignment jitter. The loss is CosFace over 5,276 identities (weights
+  start at each identity's pretrained mean embedding), plus a pull of degraded embeddings toward
+  the frozen original model's clean embedding, plus an anchor on clean embeddings. BatchNorm
+  stays frozen. Training only stage 4 reached 0.938 validation TAR; stages 3–4 reached **0.958**
+  (epoch 13 of 15, about 17 s per epoch on the RTX 5090). The model is exported back to ONNX.
+  Curves: [docs/finetune_curves.png](docs/finetune_curves.png).
+
+![fine-tuning curves](docs/finetune_curves.png)
+
+**Results.** Photo-level metrics on the 500-photo benchmarks. Each model is shown at the
+default threshold and at its own threshold. That threshold has the best F1 on the validation
+people (clean photos plus degraded versions, equal weight, 30% of the people left out of the
+gallery as unknowns), and the same value is used on both benchmarks.
+
+| benchmark | threshold | model | thr | precision | recall | F1 | exact |
+|---|---|---|---:|---:|---:|---:|---:|
+| clean | default | pretrained | 0.45 | 0.999 | 0.997 | 0.998 | 0.988 |
+| clean | default | adapter | 0.45 | 0.999 | 0.997 | 0.998 | 0.988 |
+| clean | default | fine-tuned | 0.45 | 0.999 | 0.996 | 0.997 | 0.984 |
+| clean | from val people | pretrained | 0.25 | 0.977 | 0.998 | 0.988 | 0.918 |
+| clean | from val people | adapter | 0.26 | 0.981 | 0.998 | 0.989 | 0.932 |
+| clean | from val people | fine-tuned | 0.27 | 0.985 | 0.997 | 0.991 | 0.942 |
+| hard | default | pretrained | 0.45 | 0.998 | 0.607 | 0.755 | 0.236 |
+| hard | default | adapter | 0.45 | 0.998 | 0.633 | 0.775 | 0.262 |
+| hard | default | fine-tuned | 0.45 | 0.998 | **0.699** | **0.822** | **0.344** |
+| hard | from val people | pretrained | 0.25 | 0.985 | 0.857 | 0.917 | 0.578 |
+| hard | from val people | adapter | 0.26 | 0.984 | 0.870 | 0.923 | 0.602 |
+| hard | from val people | fine-tuned | 0.27 | 0.986 | **0.892** | **0.937** | **0.648** |
+
+![recall vs threshold, hard benchmark](docs/recall_vs_threshold_hard.png)
+
+Full threshold sweeps for every model and benchmark, and the validation sweep that picked the
+thresholds: [docs/model_comparison.md](docs/model_comparison.md) and
+[docs/val_threshold_selection.png](docs/val_threshold_selection.png).
+
+- **Fine-tuning helps most on hard photos.** At the same threshold it recovers 9 points of hard
+  recall and 11 points of exact match. Recall is higher at every threshold, with no loss of
+  precision. The adapter gets about a third of that, because it only sees the 512-d embedding,
+  after most of the degradation-specific detail has already been thrown away.
+- **Clean accuracy.** At 0.45 the fine-tuned model drops by 0.001 F1 and 2 of 500 photos in
+  exact match (0.988 → 0.984). With the thresholds chosen on validation, it is better on clean
+  than pretrained (0.942 vs 0.918 exact).
+- **Validation thresholds (0.25–0.27) are lower than 0.45** because half the validation weight
+  is on degraded faces. They help hard photos a lot and cost clean exact match (0.988 → 0.92–0.94,
+  mostly extra false names). 0.45 remains the better choice for clean photo albums.
+- **Detector misses.** About 5% of hard faces are never detected, so recall can't reach 1.0
+  until the detector improves too.
+- **Cross-checks.** `tagger.py eval` with `--model` / `--adapter` reproduces these rows exactly.
+  TensorRT FP16 with the fine-tuned model gives the same precision, recall and F1 on hard, and
+  0.342 vs 0.344 exact match (one photo).
+
+**Reproduce.** The fine-tuned ONNX is 174 MB, over GitHub's 100 MB file limit, so it isn't in the
+repo. Its training settings and validation history are in `models/arcface_r50_ft.json`.
+```bash
+python make_groups.py --source lfw --out data/lfw_groups_hard --n-groups 500 --hard --gpu
+python train_adapter.py --k-degraded 24 --lambda-cls 0 --hidden 256 --dropout 0.5 --wd 0.1 --lr 3e-4 --epochs 12
+python finetune_data.py                       # needs results/adapter/embeddings_k8.npz (train_adapter.py --k-degraded 8)
+# training venv: CUDA torch is kept out of .venv so it can't clash with onnxruntime-gpu's CUDA libs
+python -m venv .venv-train && .venv-train/Scripts/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+.venv-train/Scripts/pip install onnx2torch onnx onnxscript opencv-python scikit-image matplotlib scipy
+.venv-train/Scripts/python train_finetune.py --stages 2
+python compare_models.py                      # table + plots in docs/
+python tagger.py enroll --gallery data/lfw_groups/gallery --out data/lfw_groups/gallery_ft.npz --gpu --model models/arcface_r50_ft.onnx
+```
+Galleries and album caches record which `--model` / `--adapter` produced them. A mismatched
+gallery is refused, and `search.py` re-embeds the album when the recognizer changes.
+
 ## Roadmap
 - [x] Baseline numbers on LFW groups; pick threshold from the sweep (0.45)
 - [x] Clean benchmark labels: blur unlabeled bystander faces in LFW source photos
@@ -199,7 +295,9 @@ Accuracy is unchanged with every step: CUDA and TensorRT FP16 both give precisio
 - [x] Gradio demo (faces + scene tags)
 - [x] CLIP scene tags; person + scene search
 - [ ] Scene-labeled photos to measure tag accuracy
-- [ ] Degradation adapter for hard photos (in progress: `make_groups.py --hard`, `train_adapter.py`)
+- [x] Hard benchmark (blur, low-res, occlusion, low light, JPEG); embedding adapter vs fine-tuned
+      ArcFace stages 3–4 (hard F1 0.917 → 0.937 at validation thresholds)
+- [ ] Fine-tune / robustify the detector for degraded faces (~5% never detected)
 
 ## Data note
 Only use photos of people who agreed to it, or public benchmark datasets. The sample

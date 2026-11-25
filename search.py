@@ -28,8 +28,8 @@ import cv2
 import numpy as np
 
 from fastpath import Profiler, iter_images
-from tagger import (DEFAULT_THRESHOLD, IMG_EXTS, detect_and_embed, load_models, read_image,
-                    try_read_image, write_image)
+from tagger import (DEFAULT_THRESHOLD, IMG_EXTS, detect_and_embed, load_models, model_id,
+                    read_image, try_read_image, write_image)
 
 CACHE_NAME = "album_cache.npz"
 
@@ -68,6 +68,7 @@ def person_embedding(app, ref_path):
 
 
 SCENE_KEY = "__scene_key__"   # cache-level entry: which CLIP model/labels the scene probs are for
+MODEL_KEY = "__model__"       # cache-level entry: which recognizer made the face embeddings
 
 
 def index_album(app, photos_dir, cache_path, use_cache=True, batch=True, prefetch=True,
@@ -85,7 +86,9 @@ def index_album(app, photos_dir, cache_path, use_cache=True, batch=True, prefetc
         d = np.load(cache_path, allow_pickle=True)
         cache = d["index"].item()
     sigs = {p: file_sig(p) for p in paths}
-    new = {p for p in paths if p not in cache or cache[p].get("sig") != sigs[p]}
+    # face embeddings from another recognizer (--model) are useless here: re-embed everything
+    same_model = cache.get(MODEL_KEY, "") == model_id(app)
+    new = {p for p in paths if not same_model or p not in cache or cache[p].get("sig") != sigs[p]}
     need_scene = set()
     if scene_tagger is not None:
         stale = cache.get(SCENE_KEY) != scene_tagger.key
@@ -132,6 +135,7 @@ def index_album(app, photos_dir, cache_path, use_cache=True, batch=True, prefetc
             timer.n_photos += 1
             timer.lap("overhead")
     elapsed = time.perf_counter() - t0
+    cache[MODEL_KEY] = model_id(app)
     if scene_tagger is not None:
         cache[SCENE_KEY] = scene_tagger.key
     if todo or not os.path.exists(cache_path):
@@ -162,6 +166,8 @@ def main():
                     help="embed faces one ArcFace call at a time (old behaviour, for benchmarking)")
     ap.add_argument("--no-prefetch", action="store_true",
                     help="decode images on the main thread (old behaviour, for benchmarking)")
+    ap.add_argument("--model", metavar="ONNX",
+                    help="replacement recognizer, e.g. models/arcface_r50_ft.onnx (train_finetune.py)")
     ap.add_argument("--adapter", metavar="NPZ",
                     help="apply a train_adapter.py adapter to the reference and album embeddings")
     ap.add_argument("--profile", metavar="MD_FILE",
@@ -183,7 +189,7 @@ def main():
     os.makedirs(matches_dir)
 
     t_load = time.perf_counter()
-    app = load_models(use_gpu=a.gpu, use_trt=a.trt, adapter=a.adapter)
+    app = load_models(use_gpu=a.gpu, use_trt=a.trt, adapter=a.adapter, model=a.model)
     scene_tagger = None if a.no_scenes else scn.SceneTagger(use_gpu=a.gpu, use_trt=a.trt)
     t_load = time.perf_counter() - t_load
     # warm up the models before the timed loop

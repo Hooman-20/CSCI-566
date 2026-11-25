@@ -40,9 +40,11 @@ def _trt_options(**extra):
     return opts
 
 
-def load_models(det_size=640, use_gpu=False, use_trt=False, adapter=None):
-    """adapter: path to an adapter .npz from train_adapter.py, applied to every embedding."""
-    app = _load_models(det_size, use_gpu, use_trt)
+def load_models(det_size=640, use_gpu=False, use_trt=False, adapter=None, model=None):
+    """adapter: path to an adapter .npz from train_adapter.py, applied to every embedding.
+    model: path to a replacement recognition ONNX (e.g. models/arcface_r50_ft.onnx from
+    train_finetune.py; same input layout as w600k_r50)."""
+    app = _load_models(det_size, use_gpu, use_trt, model)
     if adapter:
         from adapter import Adapter
         app.adapter = Adapter(adapter)
@@ -51,11 +53,26 @@ def load_models(det_size=640, use_gpu=False, use_trt=False, adapter=None):
     return app
 
 
+def file_id(path):
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
 def adapter_id(app):
     return app.adapter.id if getattr(app, "adapter", None) is not None else ""
 
 
-def _load_models(det_size=640, use_gpu=False, use_trt=False):
+def model_id(app):
+    """'' for the stock buffalo_l recognizer, else a hash of the --model file. Embeddings from
+    different recognizers live in different spaces: galleries and album caches record this."""
+    return getattr(app, "model_id", "")
+
+
+def _load_models(det_size=640, use_gpu=False, use_trt=False, model=None):
     # buffalo_l = SCRFD-10G detector + ArcFace ResNet50 (trained on WebFace600K)
     use_gpu = use_gpu or use_trt
     if use_gpu:
@@ -69,6 +86,16 @@ def _load_models(det_size=640, use_gpu=False, use_trt=False):
     app = FaceAnalysis(name="buffalo_l", providers=providers,
                        allowed_modules=["detection", "recognition"])
     app.prepare(ctx_id=0 if use_gpu else -1, det_size=(det_size, det_size))
+    app.model_id = ""
+    if model:
+        # swap the recognizer's session; keep ArcFaceONNX's preprocessing (mean/std 127.5)
+        import onnxruntime as ort
+        rec = app.models["recognition"]
+        rec.model_file = os.path.abspath(model)
+        rec.session = ort.InferenceSession(rec.model_file, providers=providers)
+        rec.input_name = rec.session.get_inputs()[0].name
+        rec.output_names = [o.name for o in rec.session.get_outputs()]
+        app.model_id = file_id(model)
     if use_trt:
         # TensorRT 10 DLLs come from the tensorrt-cu13==10.x pip wheel (onnxruntime-gpu 1.31 is
         # built against TensorRT 10, not 11); importing it puts nvinfer_10 on the DLL path.
@@ -167,22 +194,28 @@ def enroll(app, gallery_dir):
     return names, np.stack(centroids)
 
 
-def save_gallery(path, names, centroids, adapter=""):
-    """adapter: id of the adapter the embeddings went through ('' = plain ArcFace)."""
-    np.savez(path, names=np.array(names), centroids=centroids, adapter=np.array(adapter))
+def save_gallery(path, names, centroids, adapter="", model=""):
+    """adapter / model: ids of the adapter and recognizer the embeddings came from
+    ('' = stock buffalo_l ArcFace, no adapter)."""
+    np.savez(path, names=np.array(names), centroids=centroids, adapter=np.array(adapter),
+             model=np.array(model))
 
 
-def load_gallery(path, expect_adapter=None):
-    """If expect_adapter is given (adapter id or ''), refuse a gallery enrolled differently:
-    adapted and plain embeddings live in different spaces and must not be compared."""
+def load_gallery(path, expect_adapter=None, expect_model=None):
+    """Refuse a gallery enrolled with a different adapter (expect_adapter) or recognizer
+    (expect_model): their embeddings live in different spaces and must not be compared.
+    None skips a check; galleries from before these fields count as ''."""
     d = np.load(path, allow_pickle=False)
-    if expect_adapter is not None:
-        got = str(d["adapter"]) if "adapter" in d else ""
-        if got != expect_adapter:
+    for field, want, flag in (("adapter", expect_adapter, "--adapter"),
+                              ("model", expect_model, "--model")):
+        if want is None:
+            continue
+        got = str(d[field]) if field in d else ""
+        if got != want:
             def desc(x):
-                return f"adapter {x}" if x else "no adapter"
+                return f"{field} {x}" if x else f"no {flag}"
             raise SystemExit(f"{path} was enrolled with {desc(got)} but this run uses "
-                             f"{desc(expect_adapter)}; re-enroll with the same --adapter setting")
+                             f"{desc(want)}; re-enroll with the same {flag} setting")
     return [str(n) for n in d["names"]], d["centroids"]
 
 
@@ -267,20 +300,24 @@ def main():
         sp.add_argument("--gpu", action="store_true", help="use CUDA via onnxruntime-gpu")
         sp.add_argument("--trt", action="store_true",
                         help="use the TensorRT EP in FP16 (implies --gpu; engines cached in trt_cache/)")
+        sp.add_argument("--model", metavar="ONNX",
+                        help="replacement recognizer, e.g. models/arcface_r50_ft.onnx from "
+                             "train_finetune.py; the gallery must be enrolled with the same model")
         sp.add_argument("--adapter", metavar="NPZ",
                         help="apply a train_adapter.py adapter to every embedding; the gallery must "
                              "be enrolled with the same adapter")
 
     a = p.parse_args()
-    app = load_models(use_gpu=a.gpu, use_trt=a.trt, adapter=a.adapter)
+    app = load_models(use_gpu=a.gpu, use_trt=a.trt, adapter=a.adapter, model=a.model)
 
     if a.cmd == "enroll":
         names, cents = enroll(app, a.gallery)
-        save_gallery(a.out, names, cents, adapter=adapter_id(app))
+        save_gallery(a.out, names, cents, adapter=adapter_id(app), model=model_id(app))
         print(f"saved {len(names)} people -> {a.out}")
 
     elif a.cmd == "tag":
-        names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app))
+        names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app),
+                                    expect_model=model_id(app))
         img = read_image(a.image)
         faces, labels = tag_image(app, img, names, cents, a.threshold)
         for f, (n, s) in zip(faces, labels):
@@ -292,7 +329,8 @@ def main():
 
     elif a.cmd == "eval":
         from evaluate import run_eval
-        names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app))
+        names, cents = load_gallery(a.gallery_file, expect_adapter=adapter_id(app),
+                                    expect_model=model_id(app))
         run_eval(app, names, cents, a.test_dir, a.labels, a.out_dir, a.threshold)
 
 

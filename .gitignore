@@ -7,3 +7,6 @@ __pycache__/
 trt_cache/
 !models/*.npz
 clip_cache/
+.venv-train/
+models/*.onnx
+models/*_check.npz
