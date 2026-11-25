@@ -19,6 +19,10 @@ pip install -r requirements.txt
 pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]"
 # optional, for --trt (TensorRT FP16). onnxruntime-gpu 1.31 is built against TensorRT 10, not 11
 pip install "tensorrt-cu13==10.16.1.11"
+# scene tags (CLIP) + demo. CPU torch on purpose: CLIP runs on the GPU through onnxruntime,
+# and a CUDA torch build would bring its own CUDA 13 libraries that can clash with onnxruntime's
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install open_clip_torch onnxscript gradio
 ```
 `--trt` builds FP16 engines on first use (~45 s) and caches them in `trt_cache/`; later runs load
 in ~1.5 s. Any script that creates GPU sessions itself must call `onnxruntime.preload_dlls()`
@@ -65,7 +69,41 @@ Writes boxed copies of matching photos to `results/matches/` and every photo's b
 similarity to `results/results.csv`. Album embeddings are cached, so later searches are
 instant; add `--no-cache` to force re-indexing (e.g. for timing). `--trt` uses TensorRT FP16,
 and `--profile results/profile.md` appends a ms/photo breakdown per stage (decode, detection
-pre/infer/post, alignment, embedding, overhead).
+pre/infer/post, alignment, embedding, scene, overhead).
+
+### Person + scene
+Every photo also gets zero-shot scene tags from CLIP ViT-B/32 (open_clip, LAION-2B weights),
+stored in the album cache next to the face embeddings:
+
+```bash
+python search.py --person data/gallery/obama --scene stage --photos data/test --gpu   # person AND scene
+python search.py --scene concert indoor --photos my_album/ --gpu                      # scene only
+```
+Labels: concert, beach, jungle/forest, wedding, restaurant, office, street, stage, sports event,
+party, plus indoor/outdoor. Several `--scene` labels must all apply. "indoor"/"outdoor" get their
+own softmax because they aren't alternatives to "concert" (a concert is also indoor or
+outdoor). A photo's tags are up to 2 scenes with probability ≥ 0.3 (`--scene-min-p`), plus
+indoor or outdoor. `results.csv` has a `scenes` column.
+
+- **GPU:** the image encoder is exported once to ONNX (`clip_cache/`, ~350 MB). It runs on
+  onnxruntime CUDA (after `preload_dlls()`), or as a TensorRT FP16 engine with `--trt`.
+  Embeddings match open_clip exactly (cosine 1.00000). TensorRT FP16 has cosine ≥ 0.9998, and
+  1 of 205 photos had its tag set change (a label right at the 0.3 cutoff).
+- **Speed:** CLIP resize/crop runs in the prefetch thread with the JPEG decode. With `--trt`,
+  tagging adds about 2 ms/photo to indexing. `--no-scenes` skips it.
+- **Cache:** if an existing cache was built without scene tags, or with other labels, only the
+  CLIP step re-runs. Faces are not re-detected.
+- **Caveat:** no scene-labeled benchmark yet; tags are only spot-checked on the sample photos
+  (`office`, `street`, `party`, `stage`).
+
+## Demo
+
+```bash
+python demo.py --gallery-file gallery.npz --gpu        # http://127.0.0.1:7860
+```
+Upload a photo to get the faces boxed and named, plus scene tags and CLIP scene probabilities.
+A slider sets the face threshold. It also takes `--trt`, `--adapter` (with a gallery enrolled
+using the same adapter) and `--share`.
 
 ## Results so far
 
@@ -158,7 +196,10 @@ Accuracy is unchanged with every step: CUDA and TensorRT FP16 both give precisio
 - [x] Throughput benchmark GPU vs CPU (`search.py` timing printout)
 - [x] Batch all faces per photo; prefetch decoding; TensorRT FP16 (3.3× faster, same accuracy)
 - [ ] TensorRT INT8; move preprocessing off the main thread; batch across photos
-- [ ] Gradio demo
+- [x] Gradio demo (faces + scene tags)
+- [x] CLIP scene tags; person + scene search
+- [ ] Scene-labeled photos to measure tag accuracy
+- [ ] Degradation adapter for hard photos (in progress: `make_groups.py --hard`, `train_adapter.py`)
 
 ## Data note
 Only use photos of people who agreed to it, or public benchmark datasets. The sample
