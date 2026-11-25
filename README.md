@@ -1,17 +1,31 @@
-# Group Photo Tagger
+# Group Photo Tagger (CSCI 566)
 
 Finds every face in a group photo and labels who it is ("A and B are in this photo"),
-or "unknown" for people not enrolled.
+or "unknown" for people not enrolled. Photos can also be searched by person and by CLIP scene tag.
 
 ```
-photo ─► SCRFD detector ─► 5-point alignment (112×112) ─► ArcFace R50 ─► 512-d embedding
+photo ─► SCRFD detector ─► 5-point alignment (112×112) ─► face embedder ─► 512-d embedding
                                                                               │
 gallery (avg embedding per person) ─────────────── cosine similarity + Hungarian match ─► name / unknown
 ```
 
 Adding a new person = dropping a few photos in a folder and re-running `enroll`. No retraining.
 
-## Setup
+The project has two parts that share the detector, alignment, matching and benchmark code but
+use different face embedders:
+
+- **[Part A](#part-a-pretrained-pipeline-fine-tuning-speed-hooman)** (repo root): the full
+  tagger on pretrained InsightFace `buffalo_l` (ArcFace R50), made 3.3× faster with batching,
+  prefetching and TensorRT FP16, plus scene tags, a demo, and a hard (degraded) benchmark where an
+  embedding adapter and a fine-tuned ArcFace are compared with thresholds chosen on held-out people.
+- **[Part B](#part-b-embedder-trained-from-scratch-ablations-hard-cases-parth-muley)**
+  ([`scratch_embedder/`](scratch_embedder/README.md)): an IR-ResNet-34 embedder trained from
+  scratch with ArcFace loss on CASIA-WebFace, ablations, hard-case study and quality-augmentation
+  fix, and an end-to-end test inside the Part A tagger.
+
+## Part A: pretrained pipeline, fine-tuning, speed (Hooman)
+
+### Setup
 
 ```bash
 pip install -r requirements.txt
@@ -29,7 +43,7 @@ in ~1.5 s. Any script that creates GPU sessions itself must call `onnxruntime.pr
 first, otherwise onnxruntime silently falls back to CPU (`tagger.load_models` does this).
 Pretrained models (`buffalo_l`) download automatically to `~/.insightface/models` on first run.
 
-## Usage
+### Usage
 
 ```bash
 # 1. enroll: data/gallery/<person_name>/*.jpg  (3-10 clear photos each is ideal)
@@ -42,7 +56,7 @@ python tagger.py tag --image some_group_photo.jpg
 python tagger.py eval
 ```
 
-## No data? Generate a benchmark
+### No data? Generate a benchmark
 
 `make_groups.py` builds hundreds of labeled synthetic group photos from LFW (13k photos of
 5.7k people, downloaded automatically by scikit-learn). It holds out ~30% of people as
@@ -60,7 +74,7 @@ python tagger.py eval --gallery-file data/lfw_groups/gallery.npz \
 Metrics are photo-level: precision/recall over "who is in this photo", and exact-match rate
 (the predicted set of people is exactly right).
 
-## Find one person across an album
+### Find one person across an album
 
 ```bash
 python search.py --person data/gallery/obama --photos data/test --gpu
@@ -71,7 +85,7 @@ instant; add `--no-cache` to force re-indexing (e.g. for timing). `--trt` uses T
 and `--profile results/profile.md` appends a ms/photo breakdown per stage (decode, detection
 pre/infer/post, alignment, embedding, scene, overhead).
 
-### Person + scene
+#### Person + scene
 Every photo also gets zero-shot scene tags from CLIP ViT-B/32 (open_clip, LAION-2B weights),
 stored in the album cache next to the face embeddings:
 
@@ -96,7 +110,7 @@ indoor or outdoor. `results.csv` has a `scenes` column.
 - **Caveat:** no scene-labeled benchmark yet; tags are only spot-checked on the sample photos
   (`office`, `street`, `party`, `stage`).
 
-## Demo
+### Demo
 
 ```bash
 python demo.py --gallery-file gallery.npz --gpu        # http://127.0.0.1:7860
@@ -105,7 +119,7 @@ Upload a photo to get the faces boxed and named, plus scene tags and CLIP scene 
 A slider sets the face threshold. It also takes `--trt`, `--adapter` (with a gallery enrolled
 using the same adapter) and `--share`.
 
-## Results so far
+### Results so far
 
 LFW groups benchmark: 500 synthetic group photos (2–8 faces each), 111 enrolled people, 47
 distractors, buffalo_l (SCRFD-10G + ArcFace R50), default threshold **0.45**.
@@ -131,7 +145,7 @@ distractors, buffalo_l (SCRFD-10G + ArcFace R50), default threshold **0.45**.
 | 0.65 | 0.999 | 0.905 | 0.950 | 0.700 |
 | 0.70 | 0.999 | 0.782 | 0.877 | 0.452 |
 
-### Benchmark fix: blurring bystanders
+#### Benchmark fix: blurring bystanders
 The first run scored 0.986 precision and 94.6% fully correct photos. Most of those "false
 positives" were actually correct answers. Many LFW photos contain other people besides the
 labeled one (George W. Bush kissing Laura Bush, Erdoğan next to Gül, Colin Powell in the
@@ -144,7 +158,7 @@ several paddings and scales and merges the results, because a single pass missed
 at the photo's edge and small background faces. The random seed still produces the same 500
 groups, so before and after compare directly. Use `--keep-bystanders` to get the old behaviour.
 
-### Remaining errors (6 photos)
+#### Remaining errors (6 photos)
 - **4 real misses:**
   - **Nicole Kidman (×3):** all three of her gallery photos are blonde red-carpet shots, but her
     test photos are dark-haired film stills (similarity 0.24–0.28). This needs more varied
@@ -153,7 +167,7 @@ groups, so before and after compare directly. Use `--keep-bystanders` to get the
 - **2 likely LFW labeling problems:** the photo labeled Michael Schumacher shows a face that
   looks like Rubens Barrichello, and in the photo labeled Erdoğan the centred face is Gül.
 
-### Speed: CPU vs GPU (RTX 5090)
+#### Speed: CPU vs GPU (RTX 5090)
 Detection + embedding, from `search.py --no-cache` on 200 photos with 1–3 faces each:
 
 | | photos/s | ms/photo |
@@ -161,7 +175,7 @@ Detection + embedding, from `search.py --no-cache` on 200 photos with 1–3 face
 | CPU | 13.9 | 71.8 |
 | GPU (CUDA, onnxruntime-gpu) | 44.5 | 22.5 |
 
-### Speed-ups on LFW groups (RTX 5090)
+#### Speed-ups on LFW groups (RTX 5090)
 `search.py --no-cache` indexing of the 500 LFW group photos (5.0 faces/photo on average). Each row
 adds one change. photos/s is the median of 3 runs, and the stage breakdown comes from `--profile`
 (full tables in [docs/profile.md](docs/profile.md)):
@@ -186,7 +200,7 @@ Accuracy is unchanged with every step: CUDA and TensorRT FP16 both give precisio
 - **What's left:** CPU work (resize/normalize 2.1 ms, alignment 1.1 ms, NMS 0.5 ms) is now ~45% of
   the time. Next steps are moving it to the prefetch thread or the GPU, and batching across photos.
 
-## Hard photos: embedding adapter vs fine-tuned ArcFace
+### Hard photos: embedding adapter vs fine-tuned ArcFace
 
 **Hard benchmark.** `make_groups.py --hard` builds `data/lfw_groups_hard`, which has the same 500
 groups, layout and labels as the clean benchmark. Every face tile gets a random mix of gaussian
@@ -282,13 +296,74 @@ python tagger.py enroll --gallery data/lfw_groups/gallery --out data/lfw_groups/
 Galleries and album caches record which `--model` / `--adapter` produced them. A mismatched
 gallery is refused, and `search.py` re-embeds the album when the recognizer changes.
 
+## Part B: embedder trained from scratch, ablations, hard cases (Parth Muley)
+
+Everything for this part is in [`scratch_embedder/`](scratch_embedder/README.md) (imported from
+[ParthMuley/snap-ai-face-embedder](https://github.com/ParthMuley/snap-ai-face-embedder) with its
+history). It trains its own IR-ResNet-34 with an ArcFace head written from scratch on CASIA-WebFace
+(0.49M images, 10,572 people), and plugs it into the Part A tagger in place of ArcFace R50.
+
+**Verification accuracy (%)**:
+
+| | LFW | CFP-FP (pose) | AgeDB-30 (age) |
+|---|---|---|---|
+| ours (r34, ArcFace, 25 epochs) | 99.30 | 94.29 | 93.23 |
+| pretrained buffalo_l | 99.82 | 97.44 | 98.12 |
+
+**Ablations** (2,000-identity subset, 8 epochs, one seed; noise is about ±0.25 on LFW and ±0.5 on
+CFP-FP): r18 / r34 / r50, 128-d vs 512-d, and margin 0.3–0.7 all land within noise of each other;
+CosFace is slightly lower and plain softmax clearly lower (LFW 94.42 vs 96.48).
+
+**Hard cases** (LFW, probe image degraded): before quality augmentation the model fell to ~82% on
+heavy blur, JPEG q=5 and 16 px faces (pretrained: >98%). After a 5-epoch augmentation fine-tune:
+blur 98.3, JPEG 95.8, 16 px 91.7. Masks, sunglasses, pose and age gaps are unchanged.
+
+**Group photos** (synthetic LFW groups, same detector and matching, only the embedder differs):
+
+| model | F1 | exact-photo match |
+|---|---|---|
+| ours (before fix) | 0.989 | 92.3% |
+| ours (after fix) | 0.990 | 93.3% |
+| pretrained buffalo_l | 0.999 | 99.0% |
+
+> **Not directly comparable to Part A.** This group-photo test used 300 photos (Part A uses 500)
+> and picks each model's threshold on the same test photos it is scored on (Part A uses 0.45 or
+> thresholds chosen on held-out validation people). Its "pretrained" row also uses flip
+> test-time augmentation. Compare rows within this table, not against Part A's tables.
+
+`scratch_embedder/pipeline/group_eval.py` imports the tagger's `tagger.py` / `evaluate.py` from
+the repo root by default (`--teammate` still overrides it). Full tables:
+[`scratch_embedder/results/`](scratch_embedder/results/); setup and reproduce steps:
+[`scratch_embedder/README.md`](scratch_embedder/README.md).
+
+## Model weights
+
+Model weights are not in the repo due to size; available from the team on request.
+
+- **Part A fine-tuned ArcFace** (`models/arcface_r50_ft.onnx`, 174 MB): put it in `models/`.
+  The adapter (`models/adapter.npz`) is small and is in the repo. Pretrained `buffalo_l`
+  downloads automatically.
+- **Part B scratch embedder** (`base_slim.pt`, `aug_slim.pt`, about 140 MB each): put them in
+  `scratch_embedder/models/`. Use `aug_slim.pt` (after the quality-augmentation fine-tune).
+
+## Team & contributions
+
+- **Hooman** (Part A, repo root): tagger pipeline and LFW group benchmark (`make_groups.py`,
+  bystander blurring), evaluation, album search, speed work (batching, prefetch, TensorRT FP16,
+  profiling), CLIP scene tags and Gradio demo, hard benchmark, embedding adapter and ArcFace
+  fine-tuning with validation-chosen thresholds.
+- **Parth Muley** (Part B, `scratch_embedder/`): IR-ResNet backbone and ArcFace/CosFace heads
+  from scratch, CASIA-WebFace training on Colab, ablations, hard-case study and
+  quality-augmentation fine-tune, group-photo evaluation of the scratch embedder inside the tagger.
+
 ## Roadmap
 - [x] Baseline numbers on LFW groups; pick threshold from the sweep (0.45)
 - [x] Clean benchmark labels: blur unlabeled bystander faces in LFW source photos
 - [ ] Hard cases: small faces, profiles, occlusion — measure each separately
 - [ ] More varied gallery photos per person (e.g. Kidman misses)
 - [ ] Cluster "unknown" faces across an album (HDBSCAN) so you can name a cluster once
-- [ ] Train own embedder with ArcFace loss (CASIA-WebFace), compare to pretrained on LFW/CFP-FP
+- [x] Train own embedder with ArcFace loss (CASIA-WebFace), compare to pretrained on LFW/CFP-FP
+      (Part B, `scratch_embedder/`)
 - [x] Throughput benchmark GPU vs CPU (`search.py` timing printout)
 - [x] Batch all faces per photo; prefetch decoding; TensorRT FP16 (3.3× faster, same accuracy)
 - [ ] TensorRT INT8; move preprocessing off the main thread; batch across photos

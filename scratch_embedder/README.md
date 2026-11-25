@@ -99,11 +99,12 @@ python -m train.hard_cases --ckpt base=models/base_slim.pt aug=models/aug_slim.p
     --onnx ~/.insightface/models/buffalo_l/w600k_r50.onnx --out results/hard_cases_aug.md
 ```
 
-Group-photo evaluation (clone Hooman's repo next to this one, build the synthetic LFW groups with his `make_groups.py`):
+Group-photo evaluation (this folder now lives inside Hooman's repo, so the tagger code is imported from the repo root;
+build the synthetic LFW groups with his `make_groups.py`):
 
 ```bash
-python make_groups.py --source lfw --out ../Project_Snap_AI/group_eval/lfw_groups --n-groups 300   # run inside his repo
-python -m pipeline.group_eval --teammate ../CSCI-566 --gallery group_eval/lfw_groups/gallery \
+python ../make_groups.py --source lfw --out group_eval/lfw_groups --n-groups 300   # run from scratch_embedder/
+python -m pipeline.group_eval --gallery group_eval/lfw_groups/gallery \
     --test-dir group_eval/lfw_groups/test --labels group_eval/lfw_groups/test_labels.csv \
     --ckpt base=models/base_slim.pt aug=models/aug_slim.pt \
     --onnx ~/.insightface/models/buffalo_l/w600k_r50.onnx --out results/group_eval.md

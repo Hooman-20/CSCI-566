@@ -18,6 +18,8 @@ from insightface.app import FaceAnalysis
 from insightface.utils.face_align import norm_crop
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+# This package lives in <repo>/scratch_embedder/pipeline/; the tagger code (tagger.py, evaluate.py) is at <repo>/.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def onnx_embedder(path):
@@ -48,7 +50,8 @@ def detect(app, img):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--teammate", required=True, help="path to the teammate repo (imported, not modified)")
+    ap.add_argument("--teammate", default=REPO_ROOT,
+                    help="path to the tagger code (tagger.py, evaluate.py); default: the repo root")
     ap.add_argument("--gallery", required=True)
     ap.add_argument("--test-dir", required=True)
     ap.add_argument("--labels", required=True)
@@ -58,7 +61,8 @@ def main():
     ap.add_argument("--max-photos", type=int, default=None)
     a = ap.parse_args()
 
-    sys.path.insert(0, os.path.abspath(a.teammate))
+    # appended (not prepended) so this package's own modules are never shadowed
+    sys.path.append(os.path.abspath(a.teammate))
     from evaluate import load_labels, score              # teammate code, unchanged
     from tagger import match_faces, read_image
 
