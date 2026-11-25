@@ -356,24 +356,6 @@ Model weights are not in the repo due to size; available from the team on reques
   from scratch, CASIA-WebFace training on Colab, ablations, hard-case study and
   quality-augmentation fine-tune, group-photo evaluation of the scratch embedder inside the tagger.
 
-## Roadmap
-- [x] Baseline numbers on LFW groups; pick threshold from the sweep (0.45)
-- [x] Clean benchmark labels: blur unlabeled bystander faces in LFW source photos
-- [ ] Hard cases: small faces, profiles, occlusion — measure each separately
-- [ ] More varied gallery photos per person (e.g. Kidman misses)
-- [ ] Cluster "unknown" faces across an album (HDBSCAN) so you can name a cluster once
-- [x] Train own embedder with ArcFace loss (CASIA-WebFace), compare to pretrained on LFW/CFP-FP
-      (Part B, `scratch_embedder/`)
-- [x] Throughput benchmark GPU vs CPU (`search.py` timing printout)
-- [x] Batch all faces per photo; prefetch decoding; TensorRT FP16 (3.3× faster, same accuracy)
-- [ ] TensorRT INT8; move preprocessing off the main thread; batch across photos
-- [x] Gradio demo (faces + scene tags)
-- [x] CLIP scene tags; person + scene search
-- [ ] Scene-labeled photos to measure tag accuracy
-- [x] Hard benchmark (blur, low-res, occlusion, low light, JPEG); embedding adapter vs fine-tuned
-      ArcFace stages 3–4 (hard F1 0.917 → 0.937 at validation thresholds)
-- [ ] Fine-tune / robustify the detector for degraded faces (~5% never detected)
-
 ## Data note
 Only use photos of people who agreed to it, or public benchmark datasets. The sample
 images in `data/` come from the MIT-licensed `ageitgey/face_recognition` repo examples.
