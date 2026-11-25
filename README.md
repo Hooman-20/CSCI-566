@@ -346,15 +346,7 @@ Model weights are not in the repo due to size; available from the team on reques
 - **Part B scratch embedder** (`base_slim.pt`, `aug_slim.pt`, about 140 MB each): put them in
   `scratch_embedder/models/`. Use `aug_slim.pt` (after the quality-augmentation fine-tune).
 
-## Team & contributions
 
-- **Hooman** (Part A, repo root): tagger pipeline and LFW group benchmark (`make_groups.py`,
-  bystander blurring), evaluation, album search, speed work (batching, prefetch, TensorRT FP16,
-  profiling), CLIP scene tags and Gradio demo, hard benchmark, embedding adapter and ArcFace
-  fine-tuning with validation-chosen thresholds.
-- **Parth Muley** (Part B, `scratch_embedder/`): IR-ResNet backbone and ArcFace/CosFace heads
-  from scratch, CASIA-WebFace training on Colab, ablations, hard-case study and
-  quality-augmentation fine-tune, group-photo evaluation of the scratch embedder inside the tagger.
 
 ## Data note
 Only use photos of people who agreed to it, or public benchmark datasets. The sample
